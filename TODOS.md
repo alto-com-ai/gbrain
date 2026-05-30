@@ -1,5 +1,17 @@
 # TODOS
 
+## v0.41.37.0 critical-fix-wave follow-ups (v0.42+)
+
+Filed from the v0.41.37.0 wave (#1621 tag-wipe, #1581 grandfather hang,
+#1605 Windows migration spawn, #1569 sync ReDoS hardening). Each item was
+deliberately scoped out of the wave (see plan + GSTACK REVIEW REPORT at
+`~/.claude/plans/system-instruction-you-are-working-greedy-quiche.md`).
+
+- [ ] **#1621-followup: tag_source provenance column for frontmatter-tag REMOVAL.** The wave shipped ADD-ONLY tag reconciliation (`src/core/import-file.ts`) — re-import never deletes tags, so DB-side enrichment tags survive. Trade-off: removing a tag from a page's frontmatter no longer removes it from the DB. To restore removal-on-edit without wiping enrichment tags, add a `tags.tag_source` column (migration, both engines), stamp `'frontmatter'` on import-path tags, and reconcile by deleting only `tag_source='frontmatter'` tags absent from the new frontmatter (enrichment/backfilled tags default NULL = preserved, so no enrichment-write-site enumeration needed). Priority: P3 (additive-metadata staleness is low-harm).
+
+- [ ] **#1605-followup: convert migration backfill-phase spawns to in-process.** v0.41.37.0 made the 9 schema phases (`gbrain init --migrate-only`) run in-process via `runMigrateOnlyCore`, which unblocks `schema_version` advancement on Windows+bun+Supabase. The remaining non-schema spawns (`extract links/timeline`, `repair-jsonb`) still shell out via `runGbrainSubprocess` — they now surface child stderr (so a Windows failure is diagnosable) but still fail on Windows. Convert them to in-process calls (the extract/repair command functions are callable with an engine) so Windows brains complete data backfill, not just schema. Sites: `src/commands/migrations/v0_12_0.ts` (extract), `v0_12_2.ts` (repair), `v0_13_0.ts` (extract). Priority: P2.
+
+- [ ] **#1569-followup: root-cause the 56K-file sync wedge with the reporter's repro.** v0.41.37.0 shipped ReDoS hardening (input-length cap + star-height lint + `--no-schema-pack` escape) + diagnostics (`GBRAIN_SYNC_TRACE=1` begin-heartbeat + PGLite serve/sync concurrency doc), but did NOT root-cause the deterministic wedge at ~3100 files — the reporter's redos-guard hypothesis didn't hold (it's not on the sync path). Get the reporter's sample files (`/tmp/gbrain-hang-sample.txt`, `/tmp/gbrain-prewedge-sample.txt`), reproduce, and pin the resume-mode deep-recursion pre-import phase (prime suspect: the walk/diff/checkpoint path). Priority: P1 once a repro exists; tracked on the #1569 thread.
 ## MCP skillpack distribution — PR2 (v0.41.37+)
 
 Filed from the v0.41.36.0 skill-catalog wave (`list_skills` / `get_skill`).
