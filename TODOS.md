@@ -1522,25 +1522,34 @@ Three items deferred:
   mutex, or document the constraint and assert single-flight at the
   call site.
 
-- [ ] **Retrofit `awaitPendingSearchCacheWrites` with the same bounded
-  timeout v0.41.8.0 added to `awaitPendingLastRetrievedWrites`.** The
-  v0.36.1.x #1090 fix at `src/core/search/hybrid.ts:36-45` shipped the
-  drain pattern without a timeout; v0.41.8.0 added the timeout + warn
-  pattern to the new `awaitPendingLastRetrievedWrites` helper. For
-  symmetry (and to close the same future-failure mode in the cache
-  drain), apply the same `Promise.race` + stderr warn pattern. ~15 LOC
-  + 2 unit cases. Pair this with the drain-helper extraction below.
+- [x] **Retrofit `awaitPendingSearchCacheWrites` with a bounded timeout.**
+  DONE in v0.42.20.0 (#1762 reliability wave): `awaitPendingSearchCacheWrites`
+  is now bounded (`Promise.race` + leftover count), matching
+  `awaitPendingLastRetrievedWrites`.
 
-- [ ] **Extract a shared `createDrainHelper<T>()` factory when a third
-  fire-and-forget surface appears.** Per D4 in the v0.41.8.0 eng
-  review: two surfaces is the threshold for noticing, three for
-  extracting. `src/core/search/hybrid.ts:awaitPendingSearchCacheWrites`
-  + `src/core/last-retrieved.ts:awaitPendingLastRetrievedWrites` are
-  the two surfaces today. When a third surface is added (or when the
-  timeout-symmetry retrofit above lands and the duplication becomes
-  load-bearing), extract a `src/core/drain-helper.ts` factory consumed
-  by both call sites. Pair with the symmetry retrofit so they fire
-  together as one focused refactor.
+- [x] **Extract a shared drain abstraction once a third fire-and-forget surface
+  appears.** DONE in v0.42.20.0: rule-of-four was met (last-retrieved, facts,
+  search-cache, eval-capture), so `src/core/background-work.ts` (a registry, not
+  a per-surface factory) is the single drain owner; each sink registers a
+  drainer and CLI exit calls `drainAllBackgroundWorkForCliExit`.
+
+- [ ] **(v0.42.20.0 follow-up) Convert `runSync`'s ~20 internal `process.exit`
+  sites to `exitCode + return`.** Today those error/cost-gate paths skip the
+  background-work drain + graceful disconnect (they avoid the #1762 hang by
+  skipping disconnect entirely; worst case is a transient PGLite stale-lock that
+  self-heals via stale-reclaim). The common sync SUCCESS path already drains via
+  handleCliOnly's finally. Convert for graceful drain on sync error exits.
+
+- [ ] **(v0.42.20.0 follow-up) Decouple the op-dispatch force-exit timer** so it
+  wraps `engine.disconnect()` only (it's armed before the handler today, doubling
+  as a blanket handler watchdog) and fix its misleading "engine.disconnect() did
+  not return…" message that fires even when the handler (not disconnect) was slow.
+
+- [ ] **(v0.42.20.0 follow-up) Gateway idle-timeout (vs absolute) for streaming
+  chat.** `withDefaultTimeout` uses an absolute `AbortSignal.timeout`; a streaming
+  generation actively producing tokens past the chat default (300s) would abort.
+  Non-streaming `generateText` makes this low-risk today; revisit if a real
+  long-stream caller trips it.
 
 ---
 ## v0.41 Eval-loop wave follow-ups (v0.42+)

@@ -25,7 +25,7 @@ import type { AIGatewayConfig } from './core/ai/types.ts';
 import type { BrainEngine } from './core/engine.ts';
 import { operations, OperationError } from './core/operations.ts';
 import type { Operation, OperationContext } from './core/operations.ts';
-import { awaitPendingLastRetrievedWrites, type DrainOutcome } from './core/last-retrieved.ts';
+import { drainAllBackgroundWorkForCliExit } from './core/background-work.ts';
 import { shouldForceExitAfterMain } from './core/cli-force-exit.ts';
 import { serializeMarkdown } from './core/markdown.ts';
 import { parseGlobalFlags, setCliOptions, getCliOptions } from './core/cli-options.ts';
@@ -351,7 +351,10 @@ async function main() {
       console.warn(
         `[cli] engine.disconnect() did not return within ${DISCONNECT_HARD_DEADLINE_MS}ms — force-exiting`,
       );
-      process.exit(0);
+      // v0.42.20.0 (codex): honor an exit code an errored op already set —
+      // a bare process.exit(0) here would mask a failed op as success if the
+      // drain/disconnect then hangs.
+      process.exit(process.exitCode ?? 0);
     }, DISCONNECT_HARD_DEADLINE_MS);
     // unref so the timer itself doesn't keep the event loop alive — only
     // the actual pending work (PGLite WASM handle) does. Without unref,
@@ -359,7 +362,6 @@ async function main() {
     forceExitTimer.unref?.();
   }
 
-  let drainResult: DrainOutcome = { outcome: 'drained', pending: 0 };
   try {
     const ctx = await makeContext(engine, params);
     const rawResult = await op.handler(ctx, params);
@@ -370,55 +372,32 @@ async function main() {
     const result = JSON.parse(JSON.stringify(rawResult));
     const output = formatResult(op.name, result);
     if (output) process.stdout.write(output);
-    if (op.name === 'query') {
-      const { awaitPendingSearchCacheWrites } = await import('./core/search/hybrid.ts');
-      await awaitPendingSearchCacheWrites();
-    }
-    // Drain unconditionally for every op — empty-set fast-path is a
-    // few microseconds. Not per-op-name gated: that was the original
-    // PR #1259 mistake that left search and get_page exposed.
-    drainResult = await awaitPendingLastRetrievedWrites();
   } catch (e: unknown) {
-    // C9 fix: drain BEFORE process.exit so a successful op that throws
-    // during stdout/format still gets its bumpLastRetrievedAt UPDATE
-    // a chance to commit. Bounded by the drain's own 5s timeout; the
-    // outer hard-exit timer above bounds the disconnect path.
-    try { await awaitPendingLastRetrievedWrites(); } catch { /* best-effort */ }
+    // v0.42.20.0 (codex D4): on error, set exitCode + return so the `finally`
+    // STILL runs (drains every background-work sink + disconnects). A bare
+    // process.exit(1) here would skip the finally → skip the drain + disconnect
+    // (leaves facts/cache/eval-capture writes racing teardown). The finally's
+    // drain bounds teardown; the outer hard-deadline timer bounds a hung one.
     if (e instanceof OperationError) {
       console.error(`Error [${e.code}]: ${e.message}`);
       if (e.suggestion) console.error(`  Fix: ${e.suggestion}`);
-      process.exit(1);
+    } else {
+      console.error(e instanceof Error ? e.message : String(e));
     }
-    console.error(e instanceof Error ? e.message : String(e));
-    process.exit(1);
+    process.exitCode = 1;
   } finally {
-    // v0.41.25.0 (#1570) — drain the facts:absorb queue BEFORE disconnect
-    // so the fire-and-forget queue worker has a live engine to write its
-    // log against. Closes the bug class that absorb-log.ts:87-100 names:
-    // facts subsystem holds an engine reference past CLI exit, fires its
-    // post-completion log against a dead singleton, surfaces as a 'No
-    // database connection' stderr line on every `gbrain capture`.
-    //
-    // 1s timeout is per codex finding 10 from the v0.41.25 plan review:
-    // ops that don't enqueue facts (most read paths) pay only the
-    // 0-pending fast-path cost (~microseconds). Capture / import / sync
-    // that DO enqueue pay up to 1s while in-flight Haiku calls finish.
-    // Lazy-import keeps this off the hot path for ops that never touch
-    // the facts queue at all.
-    try {
-      const { getFactsQueue } = await import('./core/facts/queue.ts');
-      await getFactsQueue().drainPending({ timeout: 1000 });
-    } catch { /* best-effort; never block disconnect on drain failure */ }
+    // v0.42.20.0 — drain ALL fire-and-forget sinks (facts, last-retrieved,
+    // search-cache, eval-capture) via the background-work registry BEFORE
+    // disconnect, so a PGLite db.close() can't race in-flight work into the
+    // re-pump busy-loop (#1762). facts drains first (order 0) so its abort-path
+    // DB logIngest gets the freshest live-engine window. 1s per-sink timeout:
+    // read paths with no pending work pay the ~0ms fast path; capture/import
+    // that DO enqueue pay up to 1s (+ facts shutdown grace) while in-flight
+    // Haiku finishes. The unref'd hard-deadline timer above is the backstop if
+    // disconnect or a lingering socket keeps Bun's loop alive.
+    await drainAllBackgroundWorkForCliExit({ timeoutMs: 1000 });
     await engine.disconnect();
     if (forceExitTimer) clearTimeout(forceExitTimer);
-    // Narrow force-exit: only when the drain timed out AND we are NOT
-    // running a daemon. The drain helper already stderr-warned with the
-    // pending count, so the diagnostic signal is preserved. Without
-    // this guard a hung underlying promise can still keep Bun's loop
-    // alive past disconnect — Codex outside-voice finding #1.
-    if (drainResult.outcome === 'timeout' && shouldForceExitAfterMain()) {
-      process.exit(0);
-    }
   }
 }
 
@@ -1909,7 +1888,30 @@ async function handleCliOnly(command: string, args: string[]) {
     }
   } finally {
     syncWatchdog?.dispose(); // #1633: tear down the hard-deadline watchdog on clean exit
-    if (command !== 'serve') await engine.disconnect();
+    // v0.42.20.0 (#1762) — the CLI_ONLY path (which owns `gbrain capture`)
+    // lacked the op-dispatch drain-before-disconnect contract. `put_page` fires
+    // a fire-and-forget facts:absorb job AFTER printing the receipt; on a
+    // multi-chunk page that job is in flight when this finally tears the engine
+    // down, and `engine.disconnect()` nulling PGLite's _db mid-job spins
+    // db.close() into a 100%-CPU busy-loop that pins the single-writer lock.
+    // Drain every background-work sink first (facts shutdown() abort cancels a
+    // hung Haiku), THEN disconnect. The drain-before-disconnect is the causal
+    // fix; the force-exit defense below is secondary (it CANNOT preempt a WASM
+    // busy-loop on a pinned JS thread — that's exactly why the drain matters).
+    if (command !== 'serve') {
+      const forceExit = shouldForceExitAfterMain();
+      let hardExitTimer: ReturnType<typeof setTimeout> | undefined;
+      if (forceExit) {
+        hardExitTimer = setTimeout(() => {
+          console.warn('[cli] engine.disconnect() did not return within 10000ms — force-exiting');
+          process.exit(process.exitCode ?? 0);
+        }, 10_000);
+        hardExitTimer.unref?.();
+      }
+      await drainAllBackgroundWorkForCliExit();
+      await engine.disconnect();
+      if (hardExitTimer) clearTimeout(hardExitTimer);
+    }
   }
 }
 
