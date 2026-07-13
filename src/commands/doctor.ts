@@ -3226,6 +3226,183 @@ export async function computeExtractAtomsBacklogCheck(
 }
 
 /**
+ * synthesize_concepts_backlog — graph-integrity gate for atom/concept dream output.
+ *
+ * Concept synthesis is source-local and derives work from atom frontmatter. The
+ * durable "done" signal is therefore structural:
+ *   - every atom with source_slug has source↔atom provenance edges;
+ *   - every concept ref group with >=2 atoms has a concept page;
+ *   - every atom ref that points at an existing concept page has reciprocal
+ *     concept↔atom edges.
+ */
+export async function computeSynthesizeConceptsBacklogCheck(
+  engine: BrainEngine,
+): Promise<Check> {
+  const name = 'synthesize_concepts_backlog';
+  try {
+    const rows = await engine.executeRaw<{
+      atoms: number | string;
+      atoms_with_source_slug: number | string;
+      missing_source_to_atom: number | string;
+      missing_atom_to_source: number | string;
+      concept_refs: number | string;
+      eligible_concept_groups: number | string;
+      eligible_groups_without_page: number | string;
+      refs_to_existing_concepts: number | string;
+      missing_concept_to_atom: number | string;
+      missing_atom_to_concept: number | string;
+    }>(`
+      WITH atom_pages AS (
+        SELECT p.id, p.source_id, p.slug, p.frontmatter
+        FROM pages p
+        WHERE p.type = 'atom'
+          AND p.deleted_at IS NULL
+      ),
+      source_status AS (
+        SELECT
+          count(*)::int AS atoms,
+          count(*) FILTER (WHERE coalesce(frontmatter->>'source_slug', '') <> '')::int AS atoms_with_source_slug,
+          count(*) FILTER (
+            WHERE coalesce(frontmatter->>'source_slug', '') <> ''
+              AND NOT EXISTS (
+                SELECT 1 FROM links l
+                WHERE l.to_page_id = atom_pages.id
+                  AND l.link_type = 'yielded_atom'
+              )
+          )::int AS missing_source_to_atom,
+          count(*) FILTER (
+            WHERE coalesce(frontmatter->>'source_slug', '') <> ''
+              AND NOT EXISTS (
+                SELECT 1 FROM links l
+                WHERE l.from_page_id = atom_pages.id
+                  AND l.link_type = 'grounded_in_source'
+              )
+          )::int AS missing_atom_to_source
+        FROM atom_pages
+      ),
+      refs AS (
+        SELECT
+          a.id,
+          a.source_id,
+          a.slug,
+          jsonb_array_elements_text(a.frontmatter->'concepts') AS concept
+        FROM atom_pages a
+        WHERE jsonb_typeof(a.frontmatter->'concepts') = 'array'
+      ),
+      groups AS (
+        SELECT source_id, concept, count(*)::int AS atom_count
+        FROM refs
+        GROUP BY source_id, concept
+      ),
+      ref_status AS (
+        SELECT
+          count(*)::int AS concept_refs,
+          (SELECT count(*)::int FROM groups WHERE atom_count >= 2) AS eligible_concept_groups,
+          (SELECT count(*)::int
+             FROM groups g
+            WHERE g.atom_count >= 2
+              AND NOT EXISTS (
+                SELECT 1 FROM pages c
+                WHERE c.source_id = g.source_id
+                  AND c.slug = 'concepts/' || g.concept
+                  AND c.deleted_at IS NULL
+              )) AS eligible_groups_without_page,
+          count(*) FILTER (
+            WHERE EXISTS (
+              SELECT 1 FROM pages c
+              WHERE c.source_id = refs.source_id
+                AND c.slug = 'concepts/' || refs.concept
+                AND c.deleted_at IS NULL
+            )
+          )::int AS refs_to_existing_concepts,
+          count(*) FILTER (
+            WHERE EXISTS (
+              SELECT 1 FROM pages c
+              WHERE c.source_id = refs.source_id
+                AND c.slug = 'concepts/' || refs.concept
+                AND c.deleted_at IS NULL
+            )
+            AND NOT EXISTS (
+              SELECT 1
+              FROM links l
+              JOIN pages c ON c.id = l.from_page_id
+              WHERE c.source_id = refs.source_id
+                AND c.slug = 'concepts/' || refs.concept
+                AND l.to_page_id = refs.id
+                AND l.link_type = 'grounded_in'
+            )
+          )::int AS missing_concept_to_atom,
+          count(*) FILTER (
+            WHERE EXISTS (
+              SELECT 1 FROM pages c
+              WHERE c.source_id = refs.source_id
+                AND c.slug = 'concepts/' || refs.concept
+                AND c.deleted_at IS NULL
+            )
+            AND NOT EXISTS (
+              SELECT 1
+              FROM links l
+              JOIN pages c ON c.id = l.to_page_id
+              WHERE c.source_id = refs.source_id
+                AND c.slug = 'concepts/' || refs.concept
+                AND l.from_page_id = refs.id
+                AND l.link_type = 'evidence_for'
+            )
+          )::int AS missing_atom_to_concept
+        FROM refs
+      )
+      SELECT *
+      FROM source_status, ref_status
+    `);
+
+    const r = rows[0] ?? {
+      atoms: 0,
+      atoms_with_source_slug: 0,
+      missing_source_to_atom: 0,
+      missing_atom_to_source: 0,
+      concept_refs: 0,
+      eligible_concept_groups: 0,
+      eligible_groups_without_page: 0,
+      refs_to_existing_concepts: 0,
+      missing_concept_to_atom: 0,
+      missing_atom_to_concept: 0,
+    };
+    const details = Object.fromEntries(
+      Object.entries(r).map(([k, v]) => [k, Number(v ?? 0)]),
+    );
+    const broken =
+      details.missing_source_to_atom +
+      details.missing_atom_to_source +
+      details.eligible_groups_without_page +
+      details.missing_concept_to_atom +
+      details.missing_atom_to_concept;
+
+    if (broken === 0) {
+      return {
+        name,
+        status: 'ok',
+        message:
+          `concept graph complete: ${details.eligible_concept_groups} eligible concept group(s), ` +
+          `${details.refs_to_existing_concepts} linked atom→concept ref(s)`,
+        details,
+      };
+    }
+
+    return {
+      name,
+      status: 'fail',
+      message:
+        `concept graph incomplete: ${broken} missing page/link obligation(s). ` +
+        `Run: gbrain concept-synthesis --dry-run, then gbrain concept-synthesis`,
+      details,
+    };
+  } catch (err) {
+    return { name, status: 'warn', message: `synthesize_concepts_backlog check failed: ${(err as Error).message}` };
+  }
+}
+
+
+/**
  * v0.42 — extract_health doctor check.
  *
  * Reads the extract_rollup_7d table (migration v106) for the last 7 days
@@ -4850,6 +5027,14 @@ export async function buildChecks(
       checks.push(await computeExtractAtomsBacklogCheck(engine));
     } catch {
       // Best-effort; backlog query failure shouldn't stop doctor.
+    }
+  }
+
+  if (engine) {
+    try {
+      checks.push(await computeSynthesizeConceptsBacklogCheck(engine));
+    } catch {
+      // Best-effort; graph-integrity query failure shouldn't stop doctor.
     }
   }
 
