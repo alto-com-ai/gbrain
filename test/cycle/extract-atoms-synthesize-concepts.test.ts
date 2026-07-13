@@ -316,4 +316,31 @@ describe('v0.41 T6: runPhaseSynthesizeConcepts via stubbed chat', () => {
     );
     expect(rows[0].compiled_truth).toContain('Custom synthesized narrative');
   });
+
+  test('multi-source concepts remain source-local and are idempotent', async () => {
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name) VALUES ('source-a', 'source-a'), ('source-b', 'source-b') ON CONFLICT DO NOTHING`,
+    );
+    const atoms = [
+      { source_id: 'source-a', slug: 'atoms/a1', title: 'A1', body: 'A one', concept_refs: ['operating-model'] },
+      { source_id: 'source-a', slug: 'atoms/a2', title: 'A2', body: 'A two', concept_refs: ['operating-model'] },
+      { source_id: 'source-b', slug: 'atoms/b1', title: 'B1', body: 'B one', concept_refs: ['operating-model'] },
+      { source_id: 'source-b', slug: 'atoms/b2', title: 'B2', body: 'B two', concept_refs: ['operating-model'] },
+    ];
+
+    const first = await runPhaseSynthesizeConcepts(engine, { _atoms: atoms, _chat: stubChat('local narrative') });
+    expect(first.details?.concepts_written).toBe(2);
+    const rows = await engine.executeRaw<{ source_id: string }>(
+      `SELECT source_id FROM pages WHERE slug='concepts/operating-model' AND deleted_at IS NULL ORDER BY source_id`,
+    );
+    expect(rows.map((row) => row.source_id)).toEqual(['source-a', 'source-b']);
+
+    const second = await runPhaseSynthesizeConcepts(engine, { _atoms: atoms, _chat: stubChat('should not run') });
+    expect(second.details?.concepts_written).toBe(0);
+    expect(second.details?.concepts_unchanged).toBe(2);
+
+    const scoped = await runPhaseSynthesizeConcepts(engine, { sourceId: 'source-a', _atoms: atoms, dryRun: true });
+    expect(scoped.details?.groups_found).toBe(1);
+    expect(scoped.details?.concepts_unchanged).toBe(1);
+  });
 });

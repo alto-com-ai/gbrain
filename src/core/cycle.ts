@@ -226,17 +226,15 @@ export const PHASE_SCOPE: Record<CyclePhase, PhaseScope> = {
   purge: 'global',
   'schema-suggest': 'source',
   // v0.41 T9 — extract_atoms is naturally per-source (each source's
-  // transcript dir gets walked independently). synthesize_concepts is
-  // global because concept clusters cross sources by nature.
+  // transcript dir gets walked independently). Concept synthesis is also
+  // source-scoped: evidence from separate sources must never be pooled into
+  // one concept page.
   extract_atoms: 'source',
-  synthesize_concepts: 'global',
-  // v0.41.11.0 — declared 'source' for taxonomy alignment with
-  // extract_facts (per-source semantics). PHASE_SCOPE has no runtime
-  // fanout enforcement today (per the comment above); the phase
-  // wrapper does its own multi-source loop via listSources().
-  conversation_facts_backfill: 'source',
-  // v0.41.39 (#1700) — per-source (wrapper loops listSources, same as above).
-  enrich_thin: 'source',
+  synthesize_concepts: 'source',
+  // These wrappers already iterate every source internally, so they belong
+  // in the once-per-brain maintenance lane rather than every source job.
+  conversation_facts_backfill: 'global',
+  enrich_thin: 'global',
   // v0.41.20.0 SkillOpt — global (walks the skills/ directory; per-skill
   // DB lock inside D14 handles cross-source coordination).
   skillopt: 'global',
@@ -1917,6 +1915,7 @@ export async function runCycle(
         const { runPhaseSynthesizeConcepts } = await import('./cycle/synthesize-concepts.ts');
         const { result, duration_ms } = await timePhase(() => runPhaseSynthesizeConcepts(engine, {
           brainDir: brainDir ?? undefined,
+          sourceId: cycleSourceId,
           dryRun,
           // v0.41.19.0 (T3): closure refreshes cycle lock + fires outer hook.
           yieldDuringPhase: buildYieldDuringPhase(lock, opts.yieldDuringPhase),

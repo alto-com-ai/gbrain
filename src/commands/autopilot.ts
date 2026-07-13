@@ -638,6 +638,7 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
         const queue = new MinionQueue(engine);
         const slotMs = Math.floor(Date.now() / (baseInterval * 1000)) * baseInterval * 1000;
         const slot = new Date(slotMs).toISOString();
+        const targetedSlot = new Date(Math.floor(Date.now() / 3_600_000) * 3_600_000).toISOString();
         const timeoutMs = Math.max(baseInterval * 2 * 1000, 300_000);
 
         // ── v0.40 D17: per-source freshness check ────────────────────
@@ -671,7 +672,6 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
                     idempotency_key: `autopilot-sync:${src.id}:${slot}`,
                     max_attempts: 2,
                     timeout_ms: timeoutMs,
-                    maxWaiting: 1,
                   },
                 );
                 if (jsonMode) {
@@ -921,17 +921,24 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
         } else {
           // Small targeted plan — submit individual handlers per step.
           // D9 content-hash idempotency keys (from computeRecommendations).
-          // maxWaiting:1 per submit per codex #17 (closes the backpressure
-          // gap the prior implementation had for targeted submits).
+          // Terminal jobs receive a time-slotted successor key. Queue-wide
+          // waiting-job coalescing is unsafe here because it crosses sources.
           for (const step of plan) {
             try {
               const isProtected = !!step.protected;
+              let idempotencyKey = step.idempotency_key;
+              const prior = await engine.executeRaw<{ status: string }>(
+                `SELECT status FROM minion_jobs WHERE idempotency_key = $1 LIMIT 1`,
+                [step.idempotency_key],
+              );
+              if (prior.length > 0 && ['completed', 'failed', 'dead', 'cancelled'].includes(prior[0].status)) {
+                idempotencyKey = `${step.idempotency_key}:${targetedSlot}`;
+              }
               const submitOpts = {
                 queue: 'default',
-                idempotency_key: step.idempotency_key,
+                idempotency_key: idempotencyKey,
                 max_attempts: 2,
                 timeout_ms: timeoutMs,
-                maxWaiting: 1,
               };
               const job = await queue.add(
                 step.job,

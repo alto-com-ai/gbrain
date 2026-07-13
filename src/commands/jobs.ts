@@ -1385,6 +1385,12 @@ export async function registerBuiltinHandlers(
       throw err;
     }
 
+    // A successful no-change poll still proves the source is fresh. Advance
+    // the check timestamp or Autopilot will enqueue it again every interval.
+    if (sourceId && result.status === 'up_to_date') {
+      await engine.executeRaw(`UPDATE sources SET last_sync_at = now() WHERE id = $1`, [sourceId]);
+    }
+
     // v0.40 D22: auto_embed_backfill defaults TRUE when sourceId is set AND
     // the feature flag is enabled. Submits a child embed-backfill job
     // (fire-and-forget — D15.1) so stale chunks get embedded async without
