@@ -90,6 +90,7 @@ function compactJsonValue(
   maxArrayItems: number,
   maxStringLength: number,
   depth = 0,
+  key = '',
 ): unknown {
   if (typeof value === 'string') {
     return value.length > maxStringLength
@@ -99,16 +100,19 @@ function compactJsonValue(
   if (value === null || typeof value !== 'object') return value;
   if (depth >= 10) return '[nested value omitted]';
   if (Array.isArray(value)) {
-    const items = value.slice(0, maxArrayItems).map((item) =>
+    // Every top-level phase must remain visible so automation cannot miss a
+    // late failure. Only bulky diagnostic arrays inside phase details are sampled.
+    const limit = key === 'phases' ? value.length : maxArrayItems;
+    const items = value.slice(0, limit).map((item) =>
       compactJsonValue(item, maxArrayItems, maxStringLength, depth + 1));
-    if (value.length > maxArrayItems) {
-      items.push(`... ${value.length - maxArrayItems} items omitted`);
+    if (value.length > limit) {
+      items.push(`... ${value.length - limit} items omitted`);
     }
     return items;
   }
   return Object.fromEntries(Object.entries(value).map(([key, child]) => [
     key,
-    compactJsonValue(child, maxArrayItems, maxStringLength, depth + 1),
+    compactJsonValue(child, maxArrayItems, maxStringLength, depth + 1, key),
   ]));
 }
 
