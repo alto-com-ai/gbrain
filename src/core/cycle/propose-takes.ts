@@ -40,6 +40,8 @@
 import { randomUUID, createHash } from 'node:crypto';
 import { BaseCyclePhase, type ScopedReadOpts, type BasePhaseOpts } from './base-phase.ts';
 import { chat as gatewayChat } from '../ai/gateway.ts';
+import { AIConfigError } from '../ai/errors.ts';
+import { resolveModel } from '../model-config.ts';
 import { writeReceipt } from '../extract/receipt-writer.ts';
 import { upsertExtractRollup } from '../extract/rollup-writer.ts';
 import { GBrainError } from '../types.ts';
@@ -152,6 +154,7 @@ export interface ProposeTakesResult {
   cache_hits: number;
   cache_misses: number;
   proposals_inserted: number;
+  empty_pages_cached: number;
   budget_exhausted: boolean;
   warnings: string[];
 }
@@ -208,6 +211,18 @@ export function extractExistingTakesForDedup(pageBody: string): Array<{
     });
   }
   return rows;
+}
+
+/** Prevent Dream from recursively extracting takes from its own artifacts. */
+export function isProposeTakesEligiblePage(page: Pick<Page, 'slug' | 'type' | 'frontmatter'>): boolean {
+  const frontmatter = page.frontmatter && typeof page.frontmatter === 'object'
+    ? page.frontmatter as Record<string, unknown>
+    : {};
+  const type = String(page.type ?? frontmatter.type ?? '');
+  if (frontmatter.dream_generated === true) return false;
+  if (type === 'atom' || type === 'extract_receipt') return false;
+  if (page.slug.startsWith('atoms/') || page.slug.startsWith('extracts/')) return false;
+  return true;
 }
 
 /**
@@ -289,6 +304,7 @@ class ProposeTakesPhase extends BaseCyclePhase {
   protected readonly budgetUsdDefault = 5.0;
 
   protected override mapErrorCode(err: unknown): string {
+    if (err instanceof AIConfigError) return 'PROPOSE_TAKES_AI_CONFIG';
     if (err instanceof GBrainError) return err.problem;
     if (err instanceof Error) {
       if (err.message.includes('content_hash')) return 'CALIBRATION_PROPOSAL_DEDUP_FAIL';
@@ -305,6 +321,11 @@ class ProposeTakesPhase extends BaseCyclePhase {
   ): Promise<{ summary: string; details: Record<string, unknown>; status?: PhaseStatus }> {
     const extractor = opts.extractor ?? defaultExtractor;
     const promptVersion = opts.promptVersion ?? PROPOSE_TAKES_PROMPT_VERSION;
+    const model = opts.model ?? await resolveModel(engine, {
+      configKey: 'models.dream.propose_takes',
+      tier: 'utility',
+      fallback: 'openai:gpt-4o-mini',
+    });
     const pageLimit = opts.pageLimit ?? 100;
     const skipPagesWithFence = opts.skipPagesWithFence ?? false;
     const proposalRunId = `propose-${new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '')}-${randomUUID().slice(0, 8)}`;
@@ -314,9 +335,11 @@ class ProposeTakesPhase extends BaseCyclePhase {
       cache_hits: 0,
       cache_misses: 0,
       proposals_inserted: 0,
+      empty_pages_cached: 0,
       budget_exhausted: false,
       warnings: [],
     };
+    let pagesSkippedGenerated = 0;
 
     if (opts.reporter) {
       opts.reporter.start('propose_takes.pages' as never, pageLimit);
@@ -345,6 +368,10 @@ class ProposeTakesPhase extends BaseCyclePhase {
       // Skip pages that have NO prose body (e.g. metadata-only entity stubs).
       const body = page.compiled_truth ?? '';
       if (body.trim().length === 0) continue;
+      if (!isProposeTakesEligiblePage(page)) {
+        pagesSkippedGenerated += 1;
+        continue;
+      }
       if (skipPagesWithFence && hasCompleteFence(body)) continue;
 
       const ch = contentHash(body);
@@ -368,7 +395,7 @@ class ProposeTakesPhase extends BaseCyclePhase {
 
       // Budget pre-check before the LLM call. Estimate: ~1500 input tokens + 500 output.
       const budget = this.checkBudget({
-        modelId: opts.model ?? 'claude-sonnet-4-6',
+        modelId: model,
         estimatedInputTokens: 1500,
         maxOutputTokens: 500,
       });
@@ -387,11 +414,32 @@ class ProposeTakesPhase extends BaseCyclePhase {
           pagePath: page.slug,
           pageBody: body,
           existingTakes,
-          modelHint: opts.model,
+          modelHint: model,
         });
       } catch (err) {
+        if (err instanceof AIConfigError) throw err;
         const msg = err instanceof Error ? err.message : String(err);
         result.warnings.push(`extractor failed on ${page.slug}: ${msg}`);
+        continue;
+      }
+
+      if (proposals.length === 0) {
+        if (!opts.dryRun) {
+          await engine.executeRaw(
+            `INSERT INTO take_proposals
+               (source_id, page_slug, content_hash, prompt_version, proposal_run_id,
+                claim_text, kind, holder, weight, domain, dedup_against_fence_rows, model_id,
+                status, acted_at, acted_by)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'superseded', now(), 'propose_takes-empty-cache')
+             ON CONFLICT (source_id, page_slug, content_hash, prompt_version) DO NOTHING`,
+            [
+              sourceId, page.slug, ch, promptVersion, proposalRunId,
+              '__GBRAIN_NO_TAKES__', 'take', 'brain', 0, null,
+              JSON.stringify(existingTakes), model,
+            ],
+          );
+        }
+        result.empty_pages_cached += 1;
         continue;
       }
 
@@ -399,6 +447,10 @@ class ProposeTakesPhase extends BaseCyclePhase {
       // because the composite idempotency key is on the per-page tuple — a
       // bulk UPSERT would collapse a same-page-multi-claim run into one row.
       for (const p of proposals) {
+        if (opts.dryRun) {
+          result.proposals_inserted += 1;
+          continue;
+        }
         await engine.executeRaw(
           `INSERT INTO take_proposals
              (source_id, page_slug, content_hash, prompt_version, proposal_run_id,
@@ -417,7 +469,7 @@ class ProposeTakesPhase extends BaseCyclePhase {
             p.weight,
             p.domain ?? null,
             JSON.stringify(existingTakes),
-            opts.model ?? 'claude-sonnet-4-6',
+            model,
           ],
         );
         result.proposals_inserted += 1;
@@ -459,7 +511,13 @@ class ProposeTakesPhase extends BaseCyclePhase {
 
     return {
       summary: `propose_takes: scanned ${result.pages_scanned} pages, ${result.cache_hits} cached, ${result.proposals_inserted} new proposals (run ${proposalRunId})`,
-      details: { ...result, proposal_run_id: proposalRunId, prompt_version: promptVersion },
+      details: {
+        ...result,
+        pages_skipped_generated: pagesSkippedGenerated,
+        proposal_run_id: proposalRunId,
+        prompt_version: promptVersion,
+        model_id: model,
+      },
       status: result.budget_exhausted ? 'warn' : 'ok',
     };
   }
@@ -483,4 +541,5 @@ export const __testing = {
   contentHash,
   hasCompleteFence,
   extractExistingTakesForDedup,
+  isProposeTakesEligiblePage,
 };

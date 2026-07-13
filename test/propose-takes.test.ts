@@ -21,6 +21,7 @@ import {
   contentHash,
   hasCompleteFence,
   extractExistingTakesForDedup,
+  isProposeTakesEligiblePage,
   PROPOSE_TAKES_PROMPT_VERSION,
   type ProposeTakesExtractor,
   type ProposedTake,
@@ -49,6 +50,9 @@ function buildMockEngine(opts: {
       const offset = filters?.offset ?? 0;
       const limit = filters?.limit ?? 100;
       return opts.pages.slice(offset, offset + limit);
+    },
+    async getConfig() {
+      return null;
     },
     async executeRaw<T>(sql: string, params?: unknown[]): Promise<T[]> {
       captured.push({ sql, params: params ?? [] });
@@ -242,6 +246,27 @@ describe('extractExistingTakesForDedup', () => {
   });
 });
 
+describe('isProposeTakesEligiblePage', () => {
+  test('skips generated atoms, receipts, and Dream output', () => {
+    expect(isProposeTakesEligiblePage({
+      ...buildPage({ slug: 'atoms/2026/example', body: 'generated' }),
+      type: 'atom',
+    })).toBe(false);
+    expect(isProposeTakesEligiblePage({
+      ...buildPage({ slug: 'extracts/2026/run', body: 'receipt' }),
+      type: 'extract_receipt',
+    })).toBe(false);
+    expect(isProposeTakesEligiblePage({
+      ...buildPage({ slug: 'daily/2026-07-13', body: 'dream output' }),
+      frontmatter: { dream_generated: true },
+    })).toBe(false);
+  });
+
+  test('keeps ordinary source prose eligible', () => {
+    expect(isProposeTakesEligiblePage(buildPage({ slug: 'wiki/source', body: 'prose' }))).toBe(true);
+  });
+});
+
 // ─── Phase integration ──────────────────────────────────────────────
 
 describe('runPhaseProposeTakes — phase integration', () => {
@@ -307,6 +332,30 @@ describe('runPhaseProposeTakes — phase integration', () => {
     expect(details.cache_hits).toBe(100);
     expect(details.cache_misses).toBe(1);
     expect(details.pages_scanned).toBe(101);
+  });
+
+  test('empty extractor output writes a non-pending cache sentinel', async () => {
+    const pages = [buildPage({ slug: 'wiki/no-takes', body: 'plain factual prose' })];
+    const { engine, captured } = buildMockEngine({ pages });
+    const result = await runPhaseProposeTakes(buildCtx(engine), { extractor: async () => [] });
+    const details = result.details as Record<string, unknown>;
+    expect(details.empty_pages_cached).toBe(1);
+    expect(details.proposals_inserted).toBe(0);
+    const inserts = captured.filter(c => c.sql.includes('INSERT INTO take_proposals'));
+    expect(inserts).toHaveLength(1);
+    expect(inserts[0]!.sql).toContain("'superseded'");
+    expect(inserts[0]!.params[5]).toBe('__GBRAIN_NO_TAKES__');
+  });
+
+  test('dry-run reports proposals without writing rows', async () => {
+    const pages = [buildPage({ slug: 'wiki/dry-run', body: 'I bet this works.' })];
+    const { engine, captured } = buildMockEngine({ pages });
+    const result = await runPhaseProposeTakes(buildCtx(engine), {
+      extractor: async () => [{ claim_text: 'this works', kind: 'bet', holder: 'brain', weight: 0.7 }],
+      dryRun: true,
+    });
+    expect((result.details as Record<string, unknown>).proposals_inserted).toBe(1);
+    expect(captured.filter(c => c.sql.includes('INSERT INTO take_proposals'))).toHaveLength(0);
   });
 
   test('passes existing fence rows to extractor as dedup context (F2 fix)', async () => {
