@@ -20,6 +20,7 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { runDream } from '../src/commands/dream.ts';
+import { PHASE_SCOPE } from '../src/core/cycle.ts';
 import { runCycle } from '../src/core/cycle.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 
@@ -94,6 +95,8 @@ describe('runDream — checkout-less brain (no --dir, no sync.repo_path)', () =>
     if (!report) return;
     expect(report.brain_dir).toBeNull();
     expect(report.status).not.toBe('failed');
+    expect(report.phases.length).toBeGreaterThan(0);
+    expect(report.phases.every((phase) => PHASE_SCOPE[phase.phase] === 'source')).toBe(true);
   });
 });
 

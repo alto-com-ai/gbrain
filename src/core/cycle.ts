@@ -477,6 +477,11 @@ export interface CycleOpts {
    * Validated via `assertValidSourceId` in `cycleLockIdFor` (defense-in-depth).
    */
   sourceId?: string;
+  /**
+   * A source-targeted full cycle must not repeat brain-global phases once per
+   * source. Explicit single-phase calls remain available for operators.
+   */
+  sourceScopedFullCycle?: boolean;
 }
 
 // ─── Lock primitives ───────────────────────────────────────────────
@@ -1406,7 +1411,10 @@ export async function runCycle(
   opts: CycleOpts,
 ): Promise<CycleReport> {
   const start = performance.now();
-  const phases = opts.phases ?? ALL_PHASES;
+  const selectedPhases = opts.phases ?? ALL_PHASES;
+  const phases = opts.sourceScopedFullCycle && opts.sourceId && opts.sourceId !== 'default'
+    ? selectedPhases.filter((phase) => PHASE_SCOPE[phase] === 'source')
+    : selectedPhases;
   const dryRun = !!opts.dryRun;
   const pull = !!opts.pull;
   const timestamp = new Date().toISOString();

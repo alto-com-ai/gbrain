@@ -135,4 +135,16 @@ describe('dream CLI flag wiring', () => {
       expect(dreamSrc).toContain('cycle_already_running');
     });
   });
+
+  describe('--skip-phase wiring', () => {
+    test('declares repeatable skip-phase support for full cycles', () => {
+      expect(dreamSrc).toContain("'--skip-phase'");
+      expect(dreamSrc).toContain('skipPhases');
+      expect(dreamSrc).toContain('ALL_PHASES.filter');
+    });
+
+    test('rejects combining single-phase mode with skipped phases', () => {
+      expect(dreamSrc).toContain('--phase cannot be combined with --skip-phase');
+    });
+  });
 });

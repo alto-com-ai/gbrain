@@ -40,6 +40,7 @@ interface DreamArgs {
   dryRun: boolean;
   pull: boolean;
   phase: CyclePhase | null;
+  skipPhases: CyclePhase[];
   dir: string | null;
   help: boolean;
   /** v0.21: ad-hoc transcript file path; implies --phase synthesize. */
@@ -82,6 +83,68 @@ const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const DEFAULT_DRAIN_WINDOW_SECONDS = 300;
 /** Exit code for "drain ran but the backlog isn't empty — run again". */
 const EXIT_DRAIN_INCOMPLETE = 3;
+const MAX_JSON_REPORT_BYTES = 48 * 1024;
+
+function compactJsonValue(
+  value: unknown,
+  maxArrayItems: number,
+  maxStringLength: number,
+  depth = 0,
+): unknown {
+  if (typeof value === 'string') {
+    return value.length > maxStringLength
+      ? `${value.slice(0, maxStringLength)}... ${value.length - maxStringLength} chars omitted`
+      : value;
+  }
+  if (value === null || typeof value !== 'object') return value;
+  if (depth >= 10) return '[nested value omitted]';
+  if (Array.isArray(value)) {
+    const items = value.slice(0, maxArrayItems).map((item) =>
+      compactJsonValue(item, maxArrayItems, maxStringLength, depth + 1));
+    if (value.length > maxArrayItems) {
+      items.push(`... ${value.length - maxArrayItems} items omitted`);
+    }
+    return items;
+  }
+  return Object.fromEntries(Object.entries(value).map(([key, child]) => [
+    key,
+    compactJsonValue(child, maxArrayItems, maxStringLength, depth + 1),
+  ]));
+}
+
+/**
+ * Emit a valid report below common 64 KiB transport limits. Counts, statuses,
+ * phase summaries, and scalar detail fields are retained; large diagnostic
+ * collections are sampled. The final fallback is deliberately minimal and
+ * still preserves every phase's completion/failure signals.
+ */
+export function serializeDreamReportJson(report: CycleReport): string {
+  let json = JSON.stringify(compactJsonValue(report, 20, 2_048));
+  if (Buffer.byteLength(json, 'utf8') <= MAX_JSON_REPORT_BYTES) return json;
+
+  json = JSON.stringify(compactJsonValue(report, 3, 512));
+  if (Buffer.byteLength(json, 'utf8') <= MAX_JSON_REPORT_BYTES) return json;
+
+  return JSON.stringify({
+    schema_version: report.schema_version,
+    timestamp: report.timestamp,
+    duration_ms: report.duration_ms,
+    status: report.status,
+    reason: report.reason,
+    brain_dir: report.brain_dir,
+    phases: report.phases.map((phase) => ({
+      phase: phase.phase,
+      status: phase.status,
+      duration_ms: phase.duration_ms,
+      summary: compactJsonValue(phase.summary, 0, 512),
+      error: phase.error,
+      details: Object.fromEntries(Object.entries(phase.details).filter(([, value]) =>
+        value === null || ['string', 'number', 'boolean'].includes(typeof value))),
+    })),
+    totals: report.totals,
+    output_compacted: true,
+  });
+}
 
 /**
  * Collect every occurrence of `--<flag> <value>` in argv. Used to
@@ -155,6 +218,24 @@ function parseArgs(args: string[]): DreamArgs {
   // --input implies --phase synthesize.
   if (inputFile && !phase) phase = 'synthesize';
 
+  const skipPhaseValues = collectFlagValues(args, '--skip-phase');
+  if (skipPhaseValues === null) {
+    console.error(`--skip-phase <name>: missing value. Valid: ${ALL_PHASES.join(', ')}`);
+    process.exit(2);
+  }
+  const skipPhases: CyclePhase[] = [];
+  for (const raw of skipPhaseValues) {
+    if (!(ALL_PHASES as string[]).includes(raw)) {
+      console.error(`Unknown --skip-phase "${raw}". Valid: ${ALL_PHASES.join(', ')}`);
+      process.exit(2);
+    }
+    skipPhases.push(raw as CyclePhase);
+  }
+  if (phase && skipPhases.length > 0) {
+    console.error('--phase cannot be combined with --skip-phase');
+    process.exit(2);
+  }
+
   // v0.41.13: --source <id> (and the --source-id alias) drives per-source
   // cycle scoping. Resolution rules:
   //   - missing value (flag at end of argv) → exit 2 with usage
@@ -219,6 +300,7 @@ function parseArgs(args: string[]): DreamArgs {
     dryRun: args.includes('--dry-run'),
     pull: args.includes('--pull'),
     phase,
+    skipPhases: Array.from(new Set(skipPhases)),
     dir,
     help: args.includes('--help') || args.includes('-h'),
     inputFile,
@@ -310,6 +392,8 @@ Options:
                       "--dry-run" does NOT mean "zero LLM calls."
   --json              Emit the CycleReport as JSON (agent-readable)
   --phase <name>      Run a single phase: ${ALL_PHASES.join(' | ')}
+  --skip-phase <name> Omit a phase from the full cycle. Repeatable.
+                      Cannot be combined with --phase.
   --pull              git pull the brain repo before syncing (default: no pull)
   --dir <path>        Brain directory (default: configured brain). On a
                       postgres/remote brain with no local checkout, the
@@ -581,7 +665,11 @@ export async function runDream(engine: BrainEngine | null, args: string[]): Prom
     return runDrain(engine, opts, resolvedSourceId, brainDir);
   }
 
-  const phases: CyclePhase[] | undefined = opts.phase ? [opts.phase] : undefined;
+  const phases: CyclePhase[] | undefined = opts.phase
+    ? [opts.phase]
+    : opts.skipPhases.length > 0
+      ? ALL_PHASES.filter((phase) => !opts.skipPhases.includes(phase))
+      : undefined;
 
   const report = await runCycle(engine, {
     brainDir,
@@ -589,6 +677,7 @@ export async function runDream(engine: BrainEngine | null, args: string[]): Prom
     pull: opts.pull,
     phases,
     sourceId: resolvedSourceId, // undefined when --source not set → legacy back-compat
+    sourceScopedFullCycle: !opts.phase,
     synthInputFile: opts.inputFile ?? undefined,
     synthDate: opts.date ?? undefined,
     synthFrom: opts.from ?? undefined,
@@ -597,7 +686,7 @@ export async function runDream(engine: BrainEngine | null, args: string[]): Prom
   });
 
   if (opts.json) {
-    console.log(JSON.stringify(report, null, 2));
+    console.log(serializeDreamReportJson(report));
   } else {
     printHuman(report);
   }
