@@ -318,19 +318,27 @@ class ProposeTakesPhase extends BaseCyclePhase {
       warnings: [],
     };
 
-    // Load pages eligible for proposal. Source-scoped per BaseCyclePhase.
-    const pageFilters: PageFilters = {
-      ...scope,
-      limit: pageLimit,
-      sort: 'updated_desc',
-    };
-    const pages: Page[] = await engine.listPages(pageFilters);
-
     if (opts.reporter) {
-      opts.reporter.start('propose_takes.pages' as never, pages.length);
+      opts.reporter.start('propose_takes.pages' as never, pageLimit);
     }
 
-    for (const page of pages) {
+    // The limit applies to uncached candidates, not the first N pages. Fetching
+    // one fixed page window before checking the idempotency cache permanently
+    // starved older pages once the newest window became cached.
+    const batchSize = Math.max(pageLimit, 100);
+    let offset = 0;
+    pageScan: while (result.cache_misses < pageLimit) {
+      const pageFilters: PageFilters = {
+        ...scope,
+        limit: batchSize,
+        offset,
+        sort: 'updated_desc',
+      };
+      const pages: Page[] = await engine.listPages(pageFilters);
+      if (pages.length === 0) break;
+      offset += pages.length;
+
+      for (const page of pages) {
       result.pages_scanned += 1;
       this.tick(opts);
 
@@ -355,6 +363,7 @@ class ProposeTakesPhase extends BaseCyclePhase {
         result.cache_hits += 1;
         continue;
       }
+      if (result.cache_misses >= pageLimit) break pageScan;
       result.cache_misses += 1;
 
       // Budget pre-check before the LLM call. Estimate: ~1500 input tokens + 500 output.
@@ -366,9 +375,9 @@ class ProposeTakesPhase extends BaseCyclePhase {
       if (!budget.allowed) {
         result.budget_exhausted = true;
         result.warnings.push(
-          `budget exhausted at page ${result.pages_scanned}/${pages.length} (cumulative $${budget.cumulativeCostUsd.toFixed(4)} / cap $${budget.budgetUsd.toFixed(2)})`,
+          `budget exhausted after scanning ${result.pages_scanned} page(s) (cumulative $${budget.cumulativeCostUsd.toFixed(4)} / cap $${budget.budgetUsd.toFixed(2)})`,
         );
-        break;
+        break pageScan;
       }
 
       // Call the extractor. Errors on a single page log a warning but do not abort.
@@ -413,6 +422,9 @@ class ProposeTakesPhase extends BaseCyclePhase {
         );
         result.proposals_inserted += 1;
       }
+      }
+
+      if (pages.length < batchSize) break;
     }
 
     if (opts.reporter) opts.reporter.finish();

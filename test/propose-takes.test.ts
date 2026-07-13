@@ -27,7 +27,7 @@ import {
 } from '../src/core/cycle/propose-takes.ts';
 import type { OperationContext } from '../src/core/operations.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
-import type { Page } from '../src/core/types.ts';
+import type { Page, PageFilters } from '../src/core/types.ts';
 
 // ─── Mock engine ────────────────────────────────────────────────────
 
@@ -45,8 +45,10 @@ function buildMockEngine(opts: {
 
   const engine = {
     kind: 'pglite',
-    async listPages() {
-      return opts.pages;
+    async listPages(filters?: PageFilters) {
+      const offset = filters?.offset ?? 0;
+      const limit = filters?.limit ?? 100;
+      return opts.pages.slice(offset, offset + limit);
     },
     async executeRaw<T>(sql: string, params?: unknown[]): Promise<T[]> {
       captured.push({ sql, params: params ?? [] });
@@ -285,6 +287,26 @@ describe('runPhaseProposeTakes — phase integration', () => {
     // v0.42: extract rollup row UPSERTs on every phase invocation (best-
     // effort cache). Filter the assertion to take_proposals INSERTs only.
     expect(captured.filter(c => c.sql.includes('INSERT INTO take_proposals'))).toHaveLength(0);
+  });
+
+  test('cached first window does not starve an older uncached page', async () => {
+    const pages = Array.from({ length: 101 }, (_, i) =>
+      buildPage({ slug: `wiki/page-${i}`, body: `body ${i}` }));
+    const existing = new Set(pages.slice(0, 100).map((page) =>
+      `default|${page.slug}|${contentHash(page.compiled_truth ?? '')}|${PROPOSE_TAKES_PROMPT_VERSION}`));
+    const { engine } = buildMockEngine({ pages, existingProposals: existing });
+    const seen: string[] = [];
+    const extractor: ProposeTakesExtractor = async ({ pagePath }) => {
+      seen.push(pagePath);
+      return [];
+    };
+
+    const result = await runPhaseProposeTakes(buildCtx(engine), { extractor, pageLimit: 1 });
+    const details = result.details as Record<string, unknown>;
+    expect(seen).toEqual(['wiki/page-100']);
+    expect(details.cache_hits).toBe(100);
+    expect(details.cache_misses).toBe(1);
+    expect(details.pages_scanned).toBe(101);
   });
 
   test('passes existing fence rows to extractor as dedup context (F2 fix)', async () => {
